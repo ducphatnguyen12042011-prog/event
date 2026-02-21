@@ -1,59 +1,47 @@
 import discord
 from discord.ext import commands, tasks
+from discord.ui import Button, View
 import sqlite3
 import requests
-import random
 import os
+import random
 from datetime import datetime
 
 TOKEN = os.getenv("DISCORD_TOKEN")
 API_KEY = os.getenv("FOOTBALL_API")
 
+MATCH_CHANNEL_ID = 1474672512708247582
+BXH_CHANNEL_ID = 1474674662792232981
+
 intents = discord.Intents.all()
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-CASINO_LOGO = "https://i.imgur.com/8Km9tLL.png"
-
 # ================= DATABASE =================
-conn = sqlite3.connect("database.db")
+conn = sqlite3.connect("verdict.db")
 cursor = conn.cursor()
 
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS users(
-id INTEGER PRIMARY KEY,
-cash INTEGER DEFAULT 1000000,
-wins INTEGER DEFAULT 0,
-loses INTEGER DEFAULT 0)
+    id INTEGER PRIMARY KEY,
+    cash INTEGER DEFAULT 100000
+)
 """)
 
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS bets(
-user_id INTEGER,
-fixture_id INTEGER,
-team_pick TEXT,
-amount INTEGER)
-""")
-
-cursor.execute("""
-CREATE TABLE IF NOT EXISTS history(
-user_id INTEGER,
-result TEXT,
-amount INTEGER,
-time TEXT)
+    user_id INTEGER,
+    fixture_id INTEGER,
+    team TEXT,
+    amount INTEGER,
+    handicap REAL,
+    stronger TEXT,
+    settled INTEGER DEFAULT 0
+)
 """)
 
 conn.commit()
 
-# ================= UTIL =================
-def get_user(uid):
-    cursor.execute("SELECT * FROM users WHERE id=?", (uid,))
-    user = cursor.fetchone()
-    if not user:
-        cursor.execute("INSERT INTO users(id) VALUES(?)", (uid,))
-        conn.commit()
-        return get_user(uid)
-    return user
-
+# ================= API =================
 def api(endpoint):
     headers = {"x-apisports-key": API_KEY}
     return requests.get(
@@ -61,225 +49,225 @@ def api(endpoint):
         headers=headers
     ).json()
 
-def calculate_handicap(rankA, rankB):
-    diff = rankA - rankB
-    if diff <= -10:
-        return "-1.5"
-    elif diff <= -5:
-        return "-1"
-    elif diff <= -2:
-        return "-0.5"
+def get_user(uid):
+    cursor.execute("SELECT * FROM users WHERE id=?", (uid,))
+    user = cursor.fetchone()
+    if not user:
+        cursor.execute("INSERT INTO users(id) VALUES(?)", (uid,))
+        conn.commit()
+        return (uid, 100000)
+    return user
+
+# ================= TEAM POWER =================
+def calculate_power(team):
+    points = team["points"]
+    diff = team["goalsDiff"]
+    form = team["form"]
+
+    form_score = form.count("W")*3 + form.count("D")
+    return points*1.5 + diff*1.2 + form_score
+
+def auto_handicap(home_data, away_data):
+    home_power = calculate_power(home_data)
+    away_power = calculate_power(away_data)
+    diff = abs(home_power - away_power)
+
+    if diff <= 10:
+        h = 0
+    elif diff <= 25:
+        h = 0.5
+    elif diff <= 45:
+        h = 1
+    elif diff <= 70:
+        h = 1.5
     else:
-        return "0"
+        h = 2
 
-# ================= AUTO SETTLE =================
-@tasks.loop(minutes=1)
-async def auto_settle():
-    cursor.execute("SELECT * FROM bets")
-    bets = cursor.fetchall()
+    stronger = "home" if home_power > away_power else "away"
+    return stronger, h
 
-    for bet in bets:
-        fixture_id = bet[1]
-        data = api(f"fixtures?id={fixture_id}")
-        if not data["response"]:
-            continue
+# ================= AUTO MATCH =================
+@tasks.loop(minutes=30)
+async def auto_match():
+    ch = bot.get_channel(MATCH_CHANNEL_ID)
+    if not ch:
+        return
 
-        fixture = data["response"][0]
+    data = api("fixtures?next=5")
 
-        if fixture["fixture"]["status"]["short"] == "FT":
+    embed = discord.Embed(title="⚽ KÈO SẮP MỞ", color=0xf1c40f)
 
-            home = fixture["teams"]["home"]["name"]
-            away = fixture["teams"]["away"]["name"]
-            home_goals = fixture["goals"]["home"]
-            away_goals = fixture["goals"]["away"]
+    for g in data["response"]:
+        fid = g["fixture"]["id"]
+        league = g["league"]["id"]
+        season = g["league"]["season"]
 
-            winner = home if home_goals > away_goals else away
+        home = g["teams"]["home"]["name"]
+        away = g["teams"]["away"]["name"]
 
-            if bet[2] == winner:
-                cursor.execute("UPDATE users SET cash=cash+?, wins=wins+1 WHERE id=?",
-                               (bet[3]*2, bet[0]))
-                result = "✅ Thắng"
-            else:
-                cursor.execute("UPDATE users SET loses=loses+1 WHERE id=?",
-                               (bet[0],))
-                result = "❌ Thua"
+        standings = api(f"standings?league={league}&season={season}")
+        table = standings["response"][0]["league"]["standings"][0]
 
-            cursor.execute("INSERT INTO history VALUES (?,?,?,?)",
-                           (bet[0], result, bet[3], datetime.now().strftime("%H:%M")))
-            cursor.execute("DELETE FROM bets WHERE fixture_id=?", (fixture_id,))
-            conn.commit()
+        home_data = next(t for t in table if t["team"]["name"]==home)
+        away_data = next(t for t in table if t["team"]["name"]==away)
 
-# ================= WALLET =================
-class WalletView(discord.ui.View):
-    @discord.ui.button(label="📜 Lịch sử", style=discord.ButtonStyle.primary)
-    async def history(self, interaction: discord.Interaction, button: discord.ui.Button):
-        cursor.execute("SELECT result, amount FROM history WHERE user_id=?", (interaction.user.id,))
-        data = cursor.fetchall()
-        msg = ""
-        for row in data[-5:]:
-            msg += f"{row[0]} - {row[1]:,} VC\n"
-        if msg == "":
-            msg = "Chưa có dữ liệu."
-        await interaction.response.send_message(msg, ephemeral=True)
+        stronger, h = auto_handicap(home_data, away_data)
+        strong_name = home if stronger=="home" else away
 
-@bot.command()
-async def wallet(ctx):
-    user = get_user(ctx.author.id)
-    embed = discord.Embed(
-        title="💰 VÍ VERDICT CASH",
-        description=f"{user[1]:,} VC",
-        color=0x2ecc71
-    )
-    embed.set_thumbnail(url=CASINO_LOGO)
-    await ctx.send(embed=embed, view=WalletView())
+        embed.add_field(
+            name=f"{home} vs {away}",
+            value=f"ID: {fid}\nKèo: {strong_name} -{h}",
+            inline=False
+        )
 
-# ================= BXH =================
-@bot.command()
-async def bxh(ctx):
-    cursor.execute("SELECT id, cash FROM users ORDER BY cash DESC LIMIT 10")
+    await ch.send(embed=embed)
+
+# ================= AUTO BXH =================
+@tasks.loop(hours=1)
+async def auto_bxh():
+    ch = bot.get_channel(BXH_CHANNEL_ID)
+    if not ch:
+        return
+
+    cursor.execute("SELECT id,cash FROM users ORDER BY cash DESC LIMIT 10")
     data = cursor.fetchall()
 
     embed = discord.Embed(
         title="✨ BẢNG XẾP HẠNG ĐẠI GIA VERDICT CASH ✨",
         color=0xf1c40f
     )
-    embed.set_thumbnail(url=CASINO_LOGO)
 
-    for i, row in enumerate(data):
-        user = await bot.fetch_user(row[0])
-        embed.add_field(
-            name=f"#{i+1} {user.name}",
-            value=f"{row[1]:,} VC",
-            inline=False
-        )
+    for i,u in enumerate(data):
+        user = await bot.fetch_user(u[0])
+        embed.add_field(name=f"#{i+1} {user.name}",
+                        value=f"{u[1]:,} VC",
+                        inline=False)
 
-    await ctx.send(embed=embed)
+    await ch.send(embed=embed)
 
-# ================= MATCH =================
+# ================= AUTO SETTLE =================
+@tasks.loop(minutes=5)
+async def auto_settle():
+    cursor.execute("SELECT * FROM bets WHERE settled=0")
+    bets = cursor.fetchall()
+
+    for b in bets:
+        uid,fid,team,amount,handicap,stronger,settled = b
+
+        data = api(f"fixtures?id={fid}")
+        if not data["response"]:
+            continue
+
+        f = data["response"][0]
+        if f["fixture"]["status"]["short"] != "FT":
+            continue
+
+        home = f["teams"]["home"]["name"]
+        away = f["teams"]["away"]["name"]
+        hg = f["goals"]["home"]
+        ag = f["goals"]["away"]
+
+        if stronger=="home":
+            hg -= handicap
+        else:
+            ag -= handicap
+
+        winner = home if hg>ag else away
+
+        if team==winner:
+            cursor.execute("UPDATE users SET cash=cash+? WHERE id=?",
+                           (amount*2,uid))
+
+        cursor.execute("UPDATE bets SET settled=1 WHERE user_id=? AND fixture_id=?",
+                       (uid,fid))
+        conn.commit()
+
+# ================= COMMANDS =================
+
 @bot.command()
-async def match(ctx):
-    data = api("fixtures?next=5")
-    embed = discord.Embed(title="⚽ TRẬN SẮP DIỄN RA", color=0xf1c40f)
+async def wallet(ctx):
+    u = get_user(ctx.author.id)
+    await ctx.send(f"💰 Số dư: {u[1]:,} Verdict Cash")
 
-    for game in data["response"]:
-        home = game["teams"]["home"]["name"]
-        away = game["teams"]["away"]["name"]
-        logo = game["teams"]["home"]["logo"]
-        fixture_id = game["fixture"]["id"]
-
-        embed.add_field(
-            name=f"{home} vs {away}",
-            value=f"ID: {fixture_id}",
-            inline=False
-        )
-        embed.set_thumbnail(url=logo)
-
-    await ctx.send(embed=embed)
-
-# ================= BET =================
 @bot.command()
-async def bet(ctx, fixture_id: int, team: str, amount: int):
-    user = get_user(ctx.author.id)
-    if user[1] < amount:
+async def bet(ctx, fixture_id:int, team:str, amount:int):
+    u = get_user(ctx.author.id)
+    if u[1] < amount:
         return await ctx.send("❌ Không đủ tiền.")
 
-    data = api(f"standings?league=39&season=2023")
-    standings = data["response"][0]["league"]["standings"][0]
+    data = api(f"fixtures?id={fixture_id}")
+    if not data["response"]:
+        return await ctx.send("❌ Sai ID.")
 
-    rank_map = {t["team"]["name"]: t["rank"] for t in standings}
+    match = data["response"][0]
+    home = match["teams"]["home"]["name"]
+    away = match["teams"]["away"]["name"]
+
+    league = match["league"]["id"]
+    season = match["league"]["season"]
+
+    standings = api(f"standings?league={league}&season={season}")
+    table = standings["response"][0]["league"]["standings"][0]
+
+    home_data = next(t for t in table if t["team"]["name"]==home)
+    away_data = next(t for t in table if t["team"]["name"]==away)
+
+    stronger,h = auto_handicap(home_data,away_data)
 
     cursor.execute("UPDATE users SET cash=cash-? WHERE id=?",
-                   (amount, ctx.author.id))
-    cursor.execute("INSERT INTO bets VALUES (?,?,?,?)",
-                   (ctx.author.id, fixture_id, team, amount))
+                   (amount,ctx.author.id))
+
+    cursor.execute("""
+    INSERT INTO bets(user_id,fixture_id,team,amount,handicap,stronger)
+    VALUES(?,?,?,?,?,?)
+    """,(ctx.author.id,fixture_id,team,amount,h,stronger))
+
     conn.commit()
 
     embed = discord.Embed(
-        title="🎟 VÉ CƯỢC VERDICT",
-        description=f"Đội chọn: {team}\nTiền cược: {amount:,} VC",
-        color=0xf1c40f
+        title="🎟 VÉ CƯỢC",
+        description=f"{home} vs {away}\nKèo: {(home if stronger=='home' else away)} -{h}\nBạn chọn: {team}\nTiền: {amount:,}",
+        color=0x3498db
     )
-    embed.set_thumbnail(url=CASINO_LOGO)
 
     await ctx.author.send(embed=embed)
-    await ctx.send("📩 Vé đã gửi DM.")
-
-# ================= SHOP =================
-SHOP = {"VIP": 200000, "LuckyCharm": 300000}
-
-class ShopView(discord.ui.View):
-    def __init__(self, item, price):
-        super().__init__()
-        self.item = item
-        self.price = price
-
-    @discord.ui.button(label="Đổi ngay", style=discord.ButtonStyle.success)
-    async def buy(self, interaction: discord.Interaction, button: discord.ui.Button):
-        user = get_user(interaction.user.id)
-        if user[1] < self.price:
-            return await interaction.response.send_message("❌ Không đủ tiền.", ephemeral=True)
-
-        cursor.execute("UPDATE users SET cash=cash-? WHERE id=?",
-                       (self.price, interaction.user.id))
-        conn.commit()
-
-        channel = await interaction.guild.create_text_channel(f"ticket-{self.item}")
-        await channel.set_permissions(interaction.user, read_messages=True, send_messages=True)
-
-        await interaction.response.send_message("🎫 Đã tạo ticket.", ephemeral=True)
+    await ctx.send("✅ Đã gửi vé qua DM.")
 
 @bot.command()
-async def shop(ctx):
-    embed = discord.Embed(title="🛒 SHOP VERDICT", color=0x9b59b6)
-    for item, price in SHOP.items():
-        embed.add_field(name=item, value=f"{price:,} VC", inline=False)
+async def tx(ctx, choice:str, amount:int):
+    choice = choice.lower()
+    if choice not in ["tài","xỉu"]:
+        return await ctx.send("❌ nhập tài hoặc xỉu")
 
-    await ctx.send(embed=embed, view=ShopView("VIP", SHOP["VIP"]))
-
-# ================= TÀI XỈU =================
-@bot.command()
-async def taixiu(ctx, amount: int):
-    user = get_user(ctx.author.id)
-    if user[1] < amount:
+    u = get_user(ctx.author.id)
+    if u[1] < amount:
         return await ctx.send("❌ Không đủ tiền.")
 
-    if random.random() < 0.53:
-        result = "❌ Thua"
-        cursor.execute("UPDATE users SET cash=cash-?, loses=loses+1 WHERE id=?",
-                       (amount, ctx.author.id))
+    roll = random.randint(1,6)+random.randint(1,6)
+    result_type = "tài" if roll>=7 else "xỉu"
+
+    if random.random()<0.53:
+        win=False
     else:
-        result = "✅ Thắng"
-        cursor.execute("UPDATE users SET cash=cash+?, wins=wins+1 WHERE id=?",
-                       (amount, ctx.author.id))
+        win = (choice==result_type)
 
-    cursor.execute("INSERT INTO history VALUES (?,?,?,?)",
-                   (ctx.author.id, result, amount, datetime.now().strftime("%H:%M")))
+    if win:
+        cursor.execute("UPDATE users SET cash=cash+? WHERE id=?",
+                       (amount,ctx.author.id))
+        msg="✅ Thắng"
+    else:
+        cursor.execute("UPDATE users SET cash=cash-? WHERE id=?",
+                       (amount,ctx.author.id))
+        msg="❌ Thua"
+
     conn.commit()
+    await ctx.send(f"🎲 Ra {roll} → {msg}")
 
-    embed = discord.Embed(title="🎲 TÀI XỈU", description=result,
-                          color=0xe74c3c if "Thua" in result else 0x2ecc71)
-    await ctx.send(embed=embed)
-
-# ================= SOI CẦU =================
-@bot.command()
-async def cau(ctx):
-    cursor.execute("SELECT result FROM history WHERE user_id=?", (ctx.author.id,))
-    data = cursor.fetchall()
-
-    pattern = ""
-    for row in data[-10:]:
-        if "Thắng" in row[0]:
-            pattern += "🟢 "
-        else:
-            pattern += "🔴 "
-
-    if pattern == "":
-        pattern = "Chưa có dữ liệu."
-
-    await ctx.send(f"🔥 SOI CẦU:\n{pattern}")
-
+# ================= READY =================
 @bot.event
 async def on_ready():
+    auto_match.start()
+    auto_bxh.start()
     auto_settle.start()
     print("Bot Online")
 
